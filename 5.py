@@ -322,24 +322,20 @@ async def download_telegram_file(message, user_id, status_message):
 async def download_file_from_url(url, user_id, status_message):
     """
     Download a file from a URL with visual progress bar tracking.
-    Returns path of downloaded file if successful, None if failed.
+    Returns path of downloaded file and original filename without timestamp.
     """
     try:
-        # Setup download directory
         download_dir = Path("downloads") / str(user_id)
         download_dir.mkdir(parents=True, exist_ok=True)
 
-        # Use a session to handle redirects and get headers
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
         async with aiohttp.ClientSession(headers=headers) as session:
-            # Perform a HEAD request to get metadata
             async with session.head(url, allow_redirects=True) as head_response:
                 head_response.raise_for_status()
                 final_url = str(head_response.url)
 
-                # Step 1: Extract filename from Content-Disposition
                 content_disposition = head_response.headers.get('Content-Disposition')
                 file_name = None
                 if content_disposition:
@@ -347,49 +343,40 @@ async def download_file_from_url(url, user_id, status_message):
                     if match:
                         file_name = match.group(1)
                         if file_name.startswith("UTF-8''"):
-                            file_name = unquote(file_name[7:])  # Decode UTF-8 encoded filename
+                            file_name = unquote(file_name[7:])
                         else:
-                            file_name = unquote(file_name)  # Decode URL-encoded filename
+                            file_name = unquote(file_name)
 
-                # Step 2: Fallback to URL path if no Content-Disposition
                 if not file_name:
-                    path = Path(final_url.split('?')[0])  # Remove query parameters
+                    path = Path(final_url.split('?')[0])
                     segments = [s for s in path.parts if s and s != '/']
                     for segment in reversed(segments):
-                        if '.' in segment or '-' in segment:  # Look for a segment that resembles a filename
+                        if '.' in segment or '-' in segment:
                             file_name = unquote(segment)
                             break
                     if not file_name:
                         file_name = "downloaded_file"
 
-                # Step 3: Determine extension
                 extension = Path(file_name).suffix
-                if not extension:  # If no extension, guess from Content-Type
+                if not extension:
                     content_type = head_response.headers.get('Content-Type', '')
                     extension = mimetypes.guess_extension(content_type.split(';')[0]) or '.bin'
                     file_name += extension
-                else:
-                    if not extension.startswith('.'):
-                        extension = '.' + extension
-                    file_name = Path(file_name).stem + extension
 
-                # Step 4: Clean filename
-                file_name = re.sub(r'[\\/*?:"<>|]', "_", file_name.strip())
-                if not file_name or len(file_name) < 3:
-                    file_name = f"download_{uuid.uuid4().hex}{extension}"
+                # Separate original name and download name with timestamp
+                original_file_name = file_name  # Save this for upload
+                base_name = Path(file_name).stem
+                extension = Path(file_name).suffix
+                download_file_name = f"{base_name}_{int(time.time()*1000)}{extension}"
+                download_path = download_dir / download_file_name
 
-                download_path = download_dir / file_name
-
-                # Get total size if available
                 total_size = int(head_response.headers.get('Content-Length', 0))
 
-            # Perform the GET request to download the file
             async with session.get(url, allow_redirects=True) as response:
                 response.raise_for_status()
                 if not total_size:
                     total_size = int(response.headers.get('Content-Length', 0))
 
-                # Download with progress tracking
                 with open(download_path, 'wb') as f:
                     downloaded = 0
                     last_update_time = time.time()
@@ -400,7 +387,6 @@ async def download_file_from_url(url, user_id, status_message):
                             f.write(chunk)
                             downloaded += len(chunk)
 
-                            # Update progress every 0.5 seconds
                             current_time = time.time()
                             time_diff = current_time - last_update_time
                             if time_diff >= 0.5 and total_size:
@@ -411,7 +397,7 @@ async def download_file_from_url(url, user_id, status_message):
                                 downloaded_size = format_size(downloaded)
                                 total_size_str = format_size(total_size)
 
-                                display_filename = file_name[:30] + "..." if len(file_name) > 30 else file_name
+                                display_filename = original_file_name[:30] + "..." if len(original_file_name) > 30 else original_file_name
                                 status_text = (
                                     f"📁 {display_filename}\n"
                                     f"⬇️ Downloading: {percent:.1f}%\n"
@@ -424,14 +410,14 @@ async def download_file_from_url(url, user_id, status_message):
                                 last_update_time = current_time
                                 last_downloaded = downloaded
 
-        await status_message.edit_text(f"✅ Download completed: {file_name}\nStarting upload...")
-        return download_path
+        await status_message.edit_text(f"✅ Download completed: {original_file_name}\nStarting upload...")
+        return download_path, original_file_name
 
     except Exception as e:
         await status_message.edit_text(f"❌ Download failed: {str(e)[:1000]}")
         if download_dir.exists():
             shutil.rmtree(download_dir)
-        return None
+        return None, None
 
 
 def get_metadata(video_path):
@@ -468,14 +454,13 @@ async def upload_to_telegram(client, original_message, status_message):
     try:
         user_id = original_message.from_user.id
 
-        # Determine if it's a URL or Telegram file and download it
         if original_message.text:
             temp_status = await status_message.edit_text("⏳ Downloading from URL...")
-            download_path = await download_file_from_url(original_message.text, user_id, temp_status)
-            if not download_path:
+            result = await download_file_from_url(original_message.text, user_id, temp_status)
+            if not result or result[0] is None:
                 return
-            # Determine file type based on extension
-            file_ext = os.path.splitext(download_path.name)[1].lower()
+            download_path, original_file_name = result
+            file_ext = os.path.splitext(original_file_name)[1].lower()
             if file_ext in ['.mp4', '.mkv', '.avi', '.mov', '.flv']:
                 file_type = 'video'
             elif file_ext in ['.mp3', '.m4a', '.wav', '.ogg', '.flac']:
@@ -489,22 +474,22 @@ async def upload_to_telegram(client, original_message, status_message):
             download_path = await download_telegram_file(original_message, user_id, temp_status)
             if not download_path:
                 return
-            # Determine file type based on message type
             if original_message.video:
                 file_type = 'video'
+                original_file_name = original_message.video.file_name or f"video_{original_message.video.file_id}.mp4"
             elif original_message.audio:
                 file_type = 'audio'
+                original_file_name = original_message.audio.file_name or f"audio_{original_message.audio.file_id}.mp3"
             elif original_message.photo:
                 file_type = 'photo'
-            elif original_message.document:
-                file_type = 'document'
+                original_file_name = f"photo_{original_message.photo[-1].file_id}.jpg"
             else:
                 file_type = 'document'
+                original_file_name = original_message.document.file_name
 
         file_path = Path(download_path)
-        file_name = file_path.name
+        file_name = original_file_name  # Use the original name without timestamp
 
-        # Progress tracking setup
         start_time = time.time()
         last_update_time = start_time
         last_uploaded = 0
@@ -531,7 +516,6 @@ async def upload_to_telegram(client, original_message, status_message):
                 f"{uploaded_size} / {total_size_str}\n"
                 f"🚀 Speed: {speed}"
             )
-
             try:
                 await status_message.edit_text(status_text)
             except Exception as e:
@@ -540,39 +524,34 @@ async def upload_to_telegram(client, original_message, status_message):
             last_update_time = current_time
             last_uploaded = current
 
-        # Upload based on file type
         if file_type == 'video':
             try:
                 meta = get_metadata(str(file_path))
-                thumb_path = meta.get('thumb')  # Use .get() to safely handle missing thumb
+                thumb_path = meta.get('thumb')
                 if thumb_path and not Path(thumb_path).exists():
                     print(f"Thumbnail not found at: {thumb_path}")
                     thumb_path = None
 
-                # Upload video with thumbnail
-                uploaded_message = await client.send_video(
+                await client.send_video(
                     chat_id=original_message.chat.id,
                     video=str(file_path),
+                    file_name=file_name,  # Explicitly set file_name
                     caption=file_name,
                     progress=progress_callback,
                     supports_streaming=True,
                     thumb=thumb_path,
-                    **{k: v for k, v in meta.items() if k != 'thumb'}  # Pass height, width, duration
+                    **{k: v for k, v in meta.items() if k != 'thumb'}
                 )
 
-                # Cleanup thumbnail after upload
                 if thumb_path and Path(thumb_path).exists():
-                    try:
-                        Path(thumb_path).unlink()
-                        print(f"Deleted thumbnail: {thumb_path}")
-                    except Exception as e:
-                        print(f"Error deleting thumbnail: {e}")
+                    Path(thumb_path).unlink()
+                    print(f"Deleted thumbnail: {thumb_path}")
             except Exception as e:
                 print(f"Error uploading video: {e}")
-                # Fallback to document upload
                 await client.send_document(
                     chat_id=original_message.chat.id,
                     document=str(file_path),
+                    file_name=file_name,
                     caption=file_name,
                     progress=progress_callback
                 )
@@ -580,6 +559,7 @@ async def upload_to_telegram(client, original_message, status_message):
             await client.send_audio(
                 chat_id=original_message.chat.id,
                 audio=str(file_path),
+                file_name=file_name,
                 caption=file_name,
                 progress=progress_callback
             )
@@ -594,115 +574,102 @@ async def upload_to_telegram(client, original_message, status_message):
             await client.send_document(
                 chat_id=original_message.chat.id,
                 document=str(file_path),
+                file_name=file_name,
                 caption=file_name,
                 progress=progress_callback
             )
 
-        await status_message.edit_text("✅ File uploaded successfully to Telegram!")
+        await status_message.edit_text(f"✅ File uploaded successfully: {file_name}")
 
     except Exception as e:
         await status_message.edit_text(f"❌ Upload failed: {str(e)[:1000]}")
+        raise
 
     finally:
-        # Clean up
         if 'file_path' in locals() and file_path.exists():
-            file_path.unlink()
+            try:
+                file_path.unlink()
+                print(f"Deleted file: {file_path}")
+            except Exception as e:
+                print(f"Error deleting file: {e}")
         if user_id in user_states:
             del user_states[user_id]
 
 
     
-async def upload_to_rclone(download_path, remote, path, user_id, status_message):
+async def upload_to_rclone(download_path, remote, path, user_id, status_message, original_file_name=None):
     """
-    Upload downloaded file to rclone remote storage with consistent progress tracking
-    Returns True if successful, False if failed
+    Upload downloaded file to rclone remote storage with consistent progress tracking.
+    Uses original_file_name if provided, otherwise uses the download_path name without timestamp.
+    Returns True if successful, False if failed.
     """
     try:
-        # Setup paths
         config_path = Path("config") / str(user_id) / "rclone.conf"
-        file_name = download_path.name
+        file_name = original_file_name if original_file_name else Path(download_path).name
+        # Remove timestamp if present in the filename
+        file_name = re.sub(r'_\d{13}$', '', file_name)  # Removes _ followed by 13 digits (timestamp)
+        
+        # Construct remote path without creating a folder
         remote_path = f"{remote}:{path}/{file_name}" if path else f"{remote}:{file_name}"
         
-        # Get actual file size before upload for more accurate progress tracking
-        local_file_size = download_path.stat().st_size
+        local_file_size = Path(download_path).stat().st_size
         formatted_file_size = format_size(local_file_size)
-        
-        # Start upload with improved progress tracking
+
         await status_message.edit_text(
             f"📤 Preparing to upload to {remote}\n"
             f"📄 File: {file_name}\n"
             f"📦 Size: {formatted_file_size}\n"
             f"⏱️ Calculating transfer details..."
         )
-        
-        # Start rclone process
+
         process = await asyncio.create_subprocess_exec(
-            "rclone", "copy",
+            "rclone", "copyto",  # Use 'copyto' to specify exact destination
             str(download_path),
             remote_path,
             "--config", str(config_path),
             "--progress",
             "--stats", "1s",
-            "--no-check-certificate",  # Add if having SSL verification issues
+            "--no-check-certificate",
             "-v",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        
-        # Variables to track progress
+
         last_update = 0
         confirmed_size = 0
-        
+
         while True:
-            try:
-                line = await process.stdout.readline()
-                if not line:
-                    break
-                    
-                data = line.decode().strip()
-                if "Transferred:" in data:
-                    match = re.search(
-                        r"Transferred:\s+([\d.]+\s*\w+)\s+/\s+([\d.]+\s*\w+),\s+([\d.]+%)\s*,\s+([\d.]+\s*\w+/s),\s+ETA\s+([\w\s]+)",
-                        data
+            line = await process.stdout.readline()
+            if not line:
+                break
+            data = line.decode().strip()
+            if "Transferred:" in data:
+                match = re.search(
+                    r"Transferred:\s+([\d.]+\s*\w+)\s+/\s+([\d.]+\s*\w+),\s+([\d.]+%)\s*,\s+([\d.]+\s*\w+/s),\s+ETA\s+([\w\s]+)",
+                    data
+                )
+                if match and (current_time := asyncio.get_event_loop().time()) - last_update >= 1:
+                    transferred, reported_total, percentage, speed, eta = match.groups()
+                    transferred_value = float(transferred.split()[0])
+                    transferred_unit = transferred.split()[1]
+                    transferred_bytes = convert_to_bytes(transferred_value, transferred_unit)
+                    if transferred_bytes > confirmed_size:
+                        confirmed_size = transferred_bytes
+                    progress_value = min(100, max(0, (confirmed_size * 100) / local_file_size))
+
+                    progress_text = (
+                        f"📤 Uploading to {remote}\n"
+                        f"📄 File: {file_name}\n"
+                        f"{create_progress_bar(progress_value)} {progress_value:.1f}%\n"
+                        f"⚡ Speed: {speed}\n"
+                        f"📦 Progress: {transferred} / {formatted_file_size}\n"
+                        f"⏳ ETA: {eta}"
                     )
-                    
-                    if match and (current_time := asyncio.get_event_loop().time()) - last_update >= 1:
-                        transferred, reported_total, percentage, speed, eta = match.groups()
-                        
-                        # Convert transferred to bytes for consistency check
-                        transferred_value = float(transferred.split()[0])
-                        transferred_unit = transferred.split()[1]
-                        transferred_bytes = convert_to_bytes(transferred_value, transferred_unit)
-                        
-                        # Use local_file_size for consistency in progress calculation
-                        if transferred_bytes > confirmed_size:
-                            confirmed_size = transferred_bytes
-                        
-                        # Calculate consistent progress based on local file size
-                        progress_value = min(100, max(0, (confirmed_size * 100) / local_file_size))
-                        
-                        progress_text = (
-                            f"📤 Uploading to {remote}\n"
-                            f"📄 File: {file_name}\n"
-                            f"{create_progress_bar(progress_value)} {progress_value:.1f}%\n"
-                            f"⚡ Speed: {speed}\n"
-                            f"📦 Progress: {transferred} / {formatted_file_size}\n"
-                            f"⏳ ETA: {eta}"
-                        )
-                        
-                        try:
-                            await status_message.edit_text(progress_text)
-                            last_update = current_time
-                        except Exception as e:
-                            print(f"Error updating status message: {e}")
-            
-            except Exception as e:
-                print(f"Error reading process output: {e}")
-                continue
-        
-        # Wait for process to complete
+                    await status_message.edit_text(progress_text)
+                    last_update = current_time
+
         await process.wait()
-        
+
         if process.returncode == 0:
             await status_message.edit_text(
                 f"✅ Successfully uploaded to `{remote_path}`\n"
@@ -718,23 +685,18 @@ async def upload_to_rclone(download_path, remote, path, user_id, status_message)
                 f"Error details:\n{error_details}"
             )
             return False
-            
+
     except Exception as e:
-        await status_message.edit_text(
-            f"❌ Upload failed: {str(e)[:1000]}"
-        )
+        await status_message.edit_text(f"❌ Upload failed: {str(e)[:1000]}")
         return False
-    
+
     finally:
-        # Clean up just the specific file, not the entire folder
         if download_path.exists():
             try:
-                download_path.unlink()  # Remove just the file
+                download_path.unlink()
                 print(f"Deleted file: {download_path}")
             except Exception as e:
-                print(f"Error deleting file {download_path}: {e}")
-        
-        # Clean up user state
+                print(f"Error deleting file: {e}")
         if user_id in user_states:
             del user_states[user_id]
 
@@ -742,32 +704,30 @@ async def upload_to_rclone(download_path, remote, path, user_id, status_message)
 
 # ========== Callback Handlers ==========
 async def handle_file_selection(callback_query, user_id, remote, path):
-    """Handle file selection and initiate transfer"""
+    """Handle file selection and initiate transfer."""
     user_state = user_states.get(user_id)
     if not user_state or user_state.get("action") != "selecting_path":
         await callback_query.answer("❌ No active upload session")
         return
-    
+
     original_message = user_state["message"]
     await callback_query.message.edit_reply_markup(None)
     status_message = await callback_query.message.reply("⏳ Starting download...")
-    
+
     try:
-        # Handle URL downloads
         if original_message.text:
-            download_path = await download_file_from_url(original_message.text, user_id, status_message)
-        # Handle Telegram file downloads
+            download_path, original_file_name = await download_file_from_url(original_message.text, user_id, status_message)
         else:
             download_path = await download_telegram_file(original_message, user_id, status_message)
-        
+            original_file_name = download_path.name  # Fallback if not from URL
+
         if download_path:
-            await upload_to_rclone(Path(download_path), remote, path, user_id, status_message)
-    
+            await upload_to_rclone(Path(download_path), remote, path, user_id, status_message, original_file_name)
+
     except Exception as e:
         await status_message.edit_text(f"❌ Error: {str(e)[:1000]}")
-    
+
     finally:
-        # Clean up user state
         if user_id in user_states:
             del user_states[user_id]
 

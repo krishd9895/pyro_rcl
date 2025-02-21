@@ -1,6 +1,9 @@
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 import os
+import aiohttp
+from urllib.parse import unquote
+import mimetypes
 import subprocess
 import requests
 from pathlib import Path
@@ -38,8 +41,8 @@ def owner_only(func):
 # Configuration Section
 # ====================================================
 api_id = "22"   
-api_hash = "905" 
-bot_token = "713S4"
+api_hash = "95" 
+bot_token = "714"
 
 app = Client("rclone_bot", api_id, api_hash, bot_token=bot_token)
 
@@ -318,91 +321,112 @@ async def download_telegram_file(message, user_id, status_message):
 
 async def download_file_from_url(url, user_id, status_message):
     """
-    Download a file from URL with visual progress bar tracking
-    Returns path of downloaded file if successful, None if failed
+    Download a file from a URL with visual progress bar tracking.
+    Returns path of downloaded file if successful, None if failed.
     """
     try:
         # Setup download directory
         download_dir = Path("downloads") / str(user_id)
         download_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Improved filename extraction with content-disposition header
-        response = requests.head(url)
-        if 'Content-Disposition' in response.headers:
-            # Try to get filename from content-disposition header
-            cd = response.headers['Content-Disposition']
-            filename_match = re.search(r'filename="?([^"]+)"?', cd)
-            if filename_match:
-                file_name = filename_match.group(1)
-            else:
-                file_name = url.split("/")[-1].split("?")[0]
-        else:
-            # Fallback to URL-based extraction
-            file_name = url.split("/")[-1].split("?")[0]
-        
-        # Clean filename of any invalid characters
-        file_name = re.sub(r'[\\/*?:"<>|]', "_", file_name)
-        
-        # If filename is still problematic, generate a random one with extension
-        if not file_name or file_name == "" or len(file_name) < 3:
-            import uuid
-            extension = url.split(".")[-1] if "." in url.split("/")[-1] else "bin"
-            if extension.find("?") > 0:
-                extension = extension.split("?")[0]
-            file_name = f"download_{uuid.uuid4().hex}.{extension}"
-        
-        download_path = download_dir / file_name
-        
-        # Start download with progress tracking
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        total_size = int(response.headers.get('content-length', 0))
-        
-        with open(download_path, 'wb') as f:
-            downloaded = 0
-            last_update_time = time.time()
-            last_downloaded = 0
-            
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    
-                    # Update progress every 0.5 seconds
-                    current_time = time.time()
-                    time_diff = current_time - last_update_time
-                    
-                    if time_diff >= 0.5:
-                        if total_size:
-                            # Calculate speed
-                            bytes_per_second = (downloaded - last_downloaded) / time_diff
-                            speed = format_speed(bytes_per_second)
-                            
-                            # Calculate progress
-                            percent = (downloaded * 100) / total_size
-                            progress_bar = create_progress_bar(percent)
-                            downloaded_size = format_size(downloaded)
-                            total_size_str = format_size(total_size)
-                            
-                            # Truncate filename if too long
-                            display_filename = file_name[:30] + "..." if len(file_name) > 30 else file_name
-                            
-                            status_text = (
-                                f"📁 {display_filename}\n"
-                                f"⬇️ Downloading: {percent:.1f}%\n"
-                                f"{progress_bar}\n"
-                                f"{downloaded_size} / {total_size_str}\n"
-                                f"🚀 Speed: {speed}"
-                            )
-                            await status_message.edit_text(status_text)
-                            
-                            # Update tracking variables
-                            last_update_time = current_time
-                            last_downloaded = downloaded
-        
+
+        # Use a session to handle redirects and get headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        async with aiohttp.ClientSession(headers=headers) as session:
+            # Perform a HEAD request to get metadata
+            async with session.head(url, allow_redirects=True) as head_response:
+                head_response.raise_for_status()
+                final_url = str(head_response.url)
+
+                # Step 1: Extract filename from Content-Disposition
+                content_disposition = head_response.headers.get('Content-Disposition')
+                file_name = None
+                if content_disposition:
+                    match = re.search(r'filename\*?=[\'"]?(?:UTF-\d[\'"]*)?([^;\'"]+)[\'"]?', content_disposition, re.IGNORECASE)
+                    if match:
+                        file_name = match.group(1)
+                        if file_name.startswith("UTF-8''"):
+                            file_name = unquote(file_name[7:])  # Decode UTF-8 encoded filename
+                        else:
+                            file_name = unquote(file_name)  # Decode URL-encoded filename
+
+                # Step 2: Fallback to URL path if no Content-Disposition
+                if not file_name:
+                    path = Path(final_url.split('?')[0])  # Remove query parameters
+                    segments = [s for s in path.parts if s and s != '/']
+                    for segment in reversed(segments):
+                        if '.' in segment or '-' in segment:  # Look for a segment that resembles a filename
+                            file_name = unquote(segment)
+                            break
+                    if not file_name:
+                        file_name = "downloaded_file"
+
+                # Step 3: Determine extension
+                extension = Path(file_name).suffix
+                if not extension:  # If no extension, guess from Content-Type
+                    content_type = head_response.headers.get('Content-Type', '')
+                    extension = mimetypes.guess_extension(content_type.split(';')[0]) or '.bin'
+                    file_name += extension
+                else:
+                    if not extension.startswith('.'):
+                        extension = '.' + extension
+                    file_name = Path(file_name).stem + extension
+
+                # Step 4: Clean filename
+                file_name = re.sub(r'[\\/*?:"<>|]', "_", file_name.strip())
+                if not file_name or len(file_name) < 3:
+                    file_name = f"download_{uuid.uuid4().hex}{extension}"
+
+                download_path = download_dir / file_name
+
+                # Get total size if available
+                total_size = int(head_response.headers.get('Content-Length', 0))
+
+            # Perform the GET request to download the file
+            async with session.get(url, allow_redirects=True) as response:
+                response.raise_for_status()
+                if not total_size:
+                    total_size = int(response.headers.get('Content-Length', 0))
+
+                # Download with progress tracking
+                with open(download_path, 'wb') as f:
+                    downloaded = 0
+                    last_update_time = time.time()
+                    last_downloaded = 0
+
+                    async for chunk in response.content.iter_chunked(8192):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+
+                            # Update progress every 0.5 seconds
+                            current_time = time.time()
+                            time_diff = current_time - last_update_time
+                            if time_diff >= 0.5 and total_size:
+                                bytes_per_second = (downloaded - last_downloaded) / time_diff
+                                speed = format_speed(bytes_per_second)
+                                percent = (downloaded * 100) / total_size
+                                progress_bar = create_progress_bar(percent)
+                                downloaded_size = format_size(downloaded)
+                                total_size_str = format_size(total_size)
+
+                                display_filename = file_name[:30] + "..." if len(file_name) > 30 else file_name
+                                status_text = (
+                                    f"📁 {display_filename}\n"
+                                    f"⬇️ Downloading: {percent:.1f}%\n"
+                                    f"{progress_bar}\n"
+                                    f"{downloaded_size} / {total_size_str}\n"
+                                    f"🚀 Speed: {speed}"
+                                )
+                                await status_message.edit_text(status_text)
+
+                                last_update_time = current_time
+                                last_downloaded = downloaded
+
         await status_message.edit_text(f"✅ Download completed: {file_name}\nStarting upload...")
         return download_path
-    
+
     except Exception as e:
         await status_message.edit_text(f"❌ Download failed: {str(e)[:1000]}")
         if download_dir.exists():

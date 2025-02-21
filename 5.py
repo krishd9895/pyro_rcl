@@ -42,7 +42,7 @@ def owner_only(func):
 # ====================================================
 api_id = "22"   
 api_hash = "95" 
-bot_token = "714"
+bot_token = "74"
 
 app = Client("rclone_bot", api_id, api_hash, bot_token=bot_token)
 
@@ -451,13 +451,17 @@ def get_metadata(video_path):
         print(f"Error probing video: {e}")
 
     try:
-        thumb_path = Path(video_path).parent / f"{uuid.uuid4().hex}-thumbnail.png"
-        ffmpeg.input(video_path, ss=duration / 2).filter("scale", width, -1).output(str(thumb_path), vframes=1).run()
+        thumb_path = Path(video_path).parent / f"{uuid.uuid4().hex}-thumbnail.jpg"  # Use JPG instead of PNG
+        # Use -frames:v 1 and -update to explicitly write a single image
+        ffmpeg.input(video_path, ss=duration / 2).filter("scale", width, -1).output(
+            str(thumb_path), vframes=1, format='image2', update=1
+        ).run(overwrite_output=True)
         thumb = str(thumb_path)
     except Exception as e:
         print(f"Error generating thumbnail: {e}")
 
     return dict(height=height, width=width, duration=duration, thumb=thumb)
+
 
 async def upload_to_telegram(client, original_message, status_message):
     """Handle file upload to Telegram with progress tracking and FFmpeg support."""
@@ -540,17 +544,29 @@ async def upload_to_telegram(client, original_message, status_message):
         if file_type == 'video':
             try:
                 meta = get_metadata(str(file_path))
-                thumb_path = meta.pop('thumb', None)
-                await client.send_video(
+                thumb_path = meta.get('thumb')  # Use .get() to safely handle missing thumb
+                if thumb_path and not Path(thumb_path).exists():
+                    print(f"Thumbnail not found at: {thumb_path}")
+                    thumb_path = None
+
+                # Upload video with thumbnail
+                uploaded_message = await client.send_video(
                     chat_id=original_message.chat.id,
                     video=str(file_path),
                     caption=file_name,
                     progress=progress_callback,
                     supports_streaming=True,
-                    **meta  # height, width, duration
+                    thumb=thumb_path,
+                    **{k: v for k, v in meta.items() if k != 'thumb'}  # Pass height, width, duration
                 )
+
+                # Cleanup thumbnail after upload
                 if thumb_path and Path(thumb_path).exists():
-                    Path(thumb_path).unlink()
+                    try:
+                        Path(thumb_path).unlink()
+                        print(f"Deleted thumbnail: {thumb_path}")
+                    except Exception as e:
+                        print(f"Error deleting thumbnail: {e}")
             except Exception as e:
                 print(f"Error uploading video: {e}")
                 # Fallback to document upload

@@ -58,6 +58,8 @@ active_tasks = {}  # {task_id: task_info}
 status_message_id = {}  # {user_id: (chat_id, message_id)}
 task_processes = {}  # {task_id: subprocess.Process for rclone tasks}
 last_status_texts = {}  # Track last sent status text per user to avoid MESSAGE_NOT_MODIFIED
+user_status_messages = {}  # {user_id: (chat_id, message_id)}
+
 next_task_id = 1
 
 def get_next_task_id():
@@ -68,24 +70,43 @@ def get_next_task_id():
     return str(task_id)
 
 async def remove_completed_task(task_id, delay=5, completion_message=None):
-    """Remove completed task and delete its status message after delay."""
+    """Remove completed task and update the status message with remaining tasks."""
     if task_id in active_tasks:
         task = active_tasks[task_id]
+        user_id = task['user_id']
         if 'status_message' in task:
-            chat_id, message_id = task['status_message']
-            final_text = build_task_status_message(task)
-            try:
-                await app.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=final_text,
-                    parse_mode=enums.ParseMode.HTML
-                )
-            except Exception as e:
-                print(f"Error updating final status for task {task_id}: {e}")
-
-            # Wait before deleting
-            await asyncio.sleep(delay)
+            chat_id = task['status_message'][0]
+            
+            # Update status message with remaining tasks
+            remaining_tasks = [t for t in active_tasks.values() if t['user_id'] == user_id and t['task_id'] != task_id]
+            if remaining_tasks:
+                final_text = build_task_status_message(remaining_tasks)
+                if user_id in user_status_messages:
+                    status_chat_id, status_message_id = user_status_messages[user_id]
+                    try:
+                        await app.edit_message_text(
+                            chat_id=status_chat_id,
+                            message_id=status_message_id,
+                            text=final_text,
+                            parse_mode=enums.ParseMode.HTML
+                        )
+                    except Exception as e:
+                        print(f"Error editing status message for user {user_id}: {e}")
+            else:
+                if user_id in user_status_messages:
+                    status_chat_id, status_message_id = user_status_messages[user_id]
+                    try:
+                        await app.edit_message_text(
+                            chat_id=status_chat_id,
+                            message_id=status_message_id,
+                            text="✅ No active tasks.",
+                            parse_mode=enums.ParseMode.HTML
+                        )
+                        await asyncio.sleep(5)
+                        await app.delete_messages(status_chat_id, status_message_id)
+                        del user_status_messages[user_id]
+                    except Exception as e:
+                        print(f"Error cleaning up status message for user {user_id}: {e}")
 
             # Send completion message if provided
             if completion_message:
@@ -98,12 +119,9 @@ async def remove_completed_task(task_id, delay=5, completion_message=None):
                 except Exception as e:
                     print(f"Error sending completion message for task {task_id}: {e}")
 
-            # Delete the status message
-            try:
-                await app.delete_messages(chat_id, message_id)
-            except Exception as e:
-                print(f"Error deleting status message for task {task_id}: {e}")
-
+            # Wait before removing the task
+            await asyncio.sleep(delay)
+        
         if task_id in active_tasks:
             del active_tasks[task_id]
         if task_id in task_processes:
@@ -286,31 +304,36 @@ def create_progress_bar(percentage, width=10):
     bar = '■' * filled + '□' * (width - filled)
     return bar
 
-def build_task_status_message(task):
-    """Build the status message for a single task, including username or user ID."""
-    username = task.get('username')
-    user_str = f"@{username}" if username else f"User {task['user_id']}"
-    
-    progress = task['progress_percentage']
-    bar = create_progress_bar(progress)
-    processed = format_size(task['processed_size'])
-    total = format_size(task['total_size'])
-    speed = format_size(task['speed']) + "/s"
-    eta = format_time(task['eta'])
-    elapsed = format_time(task['elapsed_time'])
-    
-    message = (
-        f"🚀 <b>{user_str}'s Task</b>\n"
-        f"📄 <b>File:</b> {task['file_name']}\n"
-        f"┃ [{bar}] {progress:.1f}%\n"
-        f"┠ 📊 <b>Processed:</b> {processed} of {total}\n"
-        f"┠ 🔖 <b>Status:</b> {task['status']}\n"
-        f"┠ ⚡ <b>Speed:</b> {speed} | ⏳ <b>ETA:</b> {eta}\n"
-        f"┠ ⏱ <b>Elapsed:</b> {elapsed}\n"
-        f"┠ 🛠 <b>Engine:</b> {task['engine']}\n"
-        f"┖ ❌ /cancel_{task['task_id']}\n"
-    )
-    return message
+def build_task_status_message(tasks):
+    """Build a combined status message for all active tasks in a ladder format."""
+    if not tasks:
+        return "✅ No active tasks."
+
+    message = ""
+    for task in tasks:
+        username = task.get('username')
+        user_str = f"@{username}" if username else f"User {task['user_id']}"
+        
+        progress = task['progress_percentage']
+        bar = create_progress_bar(progress)
+        processed = format_size(task['processed_size'])
+        total = format_size(task['total_size'])
+        speed = format_size(task['speed']) + "/s"
+        eta = format_time(task['eta'])
+        elapsed = format_time(task['elapsed_time'])
+        
+        message += (
+            f"<b>File:</b> {task['file_name']}\n"
+            f"user: {user_str}\n"
+            f"┃ [{bar}] {progress:.1f}%\n"
+            f"┃ <b>Processed:</b> {processed} of {total}\n"
+            f"┃ <b>Status:</b> <a href=\"{task['url']}\">{task['status']}</a>\n"
+            f"┃ <b>Speed:</b> {speed} | <b>ETA:</b> {eta}\n"
+            f"┃ <b>Elapsed:</b> {elapsed}\n"
+            f"┃ <b>Engine:</b> {task['engine']}\n"
+            f"┖ /cancel_{task['task_id']}\n\n"
+        )
+    return message.strip()
 
 
 
@@ -343,47 +366,67 @@ def convert_to_bytes(value, unit):
     
     return int(value * multiplier)
 
-async def update_task_status(client, task_id):
-    """Update the status message for a specific task until it completes."""
+async def update_task_status(client, user_id):
+    """Update the status message for all tasks of a user, using edit mode unless a new task is added."""
+    last_task_count = 0
     last_text = ""
-    while task_id in active_tasks:
-        task = active_tasks[task_id]
-        status_text = build_task_status_message(task)
-        if status_text != last_text:
-            chat_id, message_id = task['status_message']
+    
+    while True:
+        user_tasks = [task for task in active_tasks.values() if task['user_id'] == user_id]
+        if not user_tasks:
+            if user_id in user_status_messages:
+                chat_id, message_id = user_status_messages[user_id]
+                try:
+                    await client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text="✅ No active tasks.",
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                    await asyncio.sleep(5)  # Wait before deleting
+                    await client.delete_messages(chat_id, message_id)
+                    del user_status_messages[user_id]
+                except Exception as e:
+                    print(f"Error cleaning up status message for user {user_id}: {e}")
+            break
+
+        current_task_count = len(user_tasks)
+        status_text = build_task_status_message(user_tasks)
+
+        if current_task_count != last_task_count:
+            # A new task was added or removed; send a new message
             try:
-                await client.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
+                new_status_msg = await client.send_message(
+                    chat_id=user_tasks[0]['status_message'][0],  # Use chat_id from first task
                     text=status_text,
                     parse_mode=enums.ParseMode.HTML
                 )
-                last_text = status_text
+                # Delete the old message if it exists
+                if user_id in user_status_messages:
+                    old_chat_id, old_message_id = user_status_messages[user_id]
+                    await client.delete_messages(old_chat_id, old_message_id)
+                user_status_messages[user_id] = (new_status_msg.chat.id, new_status_msg.id)
             except Exception as e:
-                if "MESSAGE_NOT_MODIFIED" not in str(e):
-                    print(f"Error updating task {task_id}: {e}")
-        await asyncio.sleep(1)
-    
-    # Final update after task completes
-    if task_id in active_tasks:
-        task = active_tasks[task_id]
-        final_text = build_task_status_message(task)
-        chat_id, message_id = task['status_message']
-        try:
-            await client.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=final_text,
-                parse_mode=enums.ParseMode.HTML
-            )
-        except Exception as e:
-            print(f"Error sending final status for task {task_id}: {e}")
-        # Optionally, delete the message after a delay
-        await asyncio.sleep(10)
-        try:
-            await client.delete_messages(chat_id, message_id)
-        except Exception as e:
-            print(f"Error deleting status message for task {task_id}: {e}")
+                print(f"Error sending new status message for user {user_id}: {e}")
+        else:
+            # No change in task count; edit the existing message
+            if status_text != last_text and user_id in user_status_messages:
+                chat_id, message_id = user_status_messages[user_id]
+                try:
+                    await client.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=status_text,
+                        parse_mode=enums.ParseMode.HTML
+                    )
+                except Exception as e:
+                    if "MESSAGE_NOT_MODIFIED" not in str(e):
+                        print(f"Error editing status message for user {user_id}: {e}")
+
+        last_task_count = current_task_count
+        last_text = status_text
+        await asyncio.sleep(1)  # Update every second  
+        
             
 async def update_status_message(client, user_id):
     """Periodically update the status message with improved error handling and deduplication."""
@@ -478,15 +521,20 @@ async def download_telegram_file(message, user_id, username):
             'user_id': user_id,
             'task_id': task_id,
             'username': username,
-            'cancelled': False  # Flag for cancellation
+            'cancelled': False
         }
         
-        status_msg = await message.reply(
-            build_task_status_message(active_tasks[task_id]),
-            parse_mode=enums.ParseMode.HTML
-        )
-        active_tasks[task_id]['status_message'] = (status_msg.chat.id, status_msg.id)
-        asyncio.create_task(update_task_status(app, task_id))
+        # Send initial status message only if it's the first task
+        user_tasks = [task for task in active_tasks.values() if task['user_id'] == user_id]
+        if len(user_tasks) == 1:  # First task
+            status_msg = await message.reply(
+                build_task_status_message(user_tasks),
+                parse_mode=enums.ParseMode.HTML
+            )
+            active_tasks[task_id]['status_message'] = (status_msg.chat.id, status_msg.id)
+            user_status_messages[user_id] = (status_msg.chat.id, status_msg.id)
+            asyncio.create_task(update_task_status(app, user_id))
+        # For additional tasks, update_task_status will handle the new message
         
         start_time = time.time()
         last_update_time = start_time
@@ -597,16 +645,21 @@ async def download_file_from_url(url, user_id, username):
                 'task_id': task_id,
                 'username': username,
                 'cancelled': False,
-                'session': session  # Store session for cancellation
+                'session': session
             }
             
-            status_msg = await app.send_message(
-                chat_id=user_id,
-                text=build_task_status_message(active_tasks[task_id]),
-                parse_mode=enums.ParseMode.HTML
-            )
-            active_tasks[task_id]['status_message'] = (status_msg.chat.id, status_msg.id)
-            asyncio.create_task(update_task_status(app, task_id))
+            # Send initial status message only if it's the first task
+            user_tasks = [task for task in active_tasks.values() if task['user_id'] == user_id]
+            if len(user_tasks) == 1:  # First task
+                status_msg = await app.send_message(
+                    chat_id=user_id,
+                    text=build_task_status_message(user_tasks),
+                    parse_mode=enums.ParseMode.HTML
+                )
+                active_tasks[task_id]['status_message'] = (status_msg.chat.id, status_msg.id)
+                user_status_messages[user_id] = (status_msg.chat.id, status_msg.id)
+                asyncio.create_task(update_task_status(app, user_id))
+            # For additional tasks, update_task_status will handle the new message
         
         async with session.get(url, allow_redirects=True) as response:
             response.raise_for_status()
@@ -825,7 +878,7 @@ async def upload_to_telegram(client, original_message, username):
         active_tasks[task_id]['status'] = 'Uploaded'
         active_tasks[task_id]['progress_percentage'] = 100
         completion_message = (
-            f"✅ <b>{'@' + username if username else 'User ' + str(user_id)}'s Task Completed</b>\n"
+            f"✅ <b>{'@' + username if username else 'User ' + str(user_id)}'s Task {task_id} Completed</b>\n"
             f"<b>File:</b> {file_name}\n"
             f"<b>Destination:</b> Telegram"
         )
@@ -925,7 +978,7 @@ async def upload_to_rclone(download_path, remote, path, user_id, username, task_
             active_tasks[task_id]['status'] = 'Uploaded'
             active_tasks[task_id]['progress_percentage'] = 100
             completion_message = (
-                f"✅ <b>{'@' + username if username else 'User ' + str(user_id)}'s Task Completed</b>\n"
+                f"✅ <b>{'@' + username if username else 'User ' + str(user_id)}'s Task {task_id} Completed</b>\n"
                 f"<b>File:</b> {file_name}\n"
                 f"<b>Destination:</b> {remote_path}"
             )
@@ -1096,25 +1149,28 @@ async def handle_platform_selection(client, callback_query):
     original_message = user_states[user_id]["message"]
     username = original_message.from_user.username
     
+    # Delete the "📤 Select where to upload:" message
+    try:
+        await callback_query.message.delete()
+    except Exception as e:
+        print(f"Error deleting platform selection message for user {user_id}: {e}")
+    
     if platform == "telegram":
-        await callback_query.message.edit_reply_markup(None)
         await upload_to_telegram(client, original_message, username)
     
     elif platform == "rclone":
         config_path = Path("config") / str(user_id) / "rclone.conf"
         if not config_path.exists():
-            await callback_query.message.edit_text(
-                "❌ Please upload your rclone.conf file first using /config",
-                reply_markup=None
+            await callback_query.message.reply(
+                "❌ Please upload your rclone.conf file first using /config"
             )
             return
         
         navigator = RcloneNavigator()
         remotes = navigator.get_rclone_remotes(user_id)
         if not remotes:
-            await callback_query.message.edit_text(
-                "❌ No remotes found in your rclone config",
-                reply_markup=None
+            await callback_query.message.reply(
+                "❌ No remotes found in your rclone config"
             )
             return
         
@@ -1130,10 +1186,11 @@ async def handle_platform_selection(client, callback_query):
             ]
             keyboard.append(row)
         
-        await callback_query.message.edit_text(
+        await callback_query.message.reply(
             "🌩 Select a cloud storage:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        
 @app.on_message(filters.command("cancel_"))
 async def cancel_task(client, message):
     """Cancel a specific task, stopping both download and upload."""
@@ -1148,27 +1205,23 @@ async def cancel_task(client, message):
         await message.reply("❌ You are not authorized to cancel this task.")
         return
 
-    # Mark task as cancelled
     active_tasks[task_id]['cancelled'] = True
     active_tasks[task_id]['status'] = 'Cancelling'
 
-    # Cancel rclone upload if active
     if task_id in task_processes:
         process = task_processes[task_id]
         process.terminate()
         try:
-            await process.wait()  # Ensure process is fully terminated
+            await process.wait()
         except Exception as e:
             print(f"Error waiting for process termination: {e}")
         del task_processes[task_id]
 
-    # Cancel aiohttp download if active
     if 'session' in active_tasks[task_id] and active_tasks[task_id]['session']:
         session = active_tasks[task_id]['session']
         await session.close()
         active_tasks[task_id]['session'] = None
 
-    # Update status and remove task
     active_tasks[task_id]['status'] = 'Cancelled'
     await message.reply(f"✅ Task {task_id} cancelled.")
     asyncio.create_task(remove_completed_task(task_id, delay=0))
